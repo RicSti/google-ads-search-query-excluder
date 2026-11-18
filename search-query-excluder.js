@@ -16,7 +16,7 @@
  *   - Creates the negative keyword list and attaches it to matching campaigns
  *
  * @name        Search Query Excluder
- * @version     1.0.0
+ * @version     1.1.0
  * @author      Richard Stinauer (adtraffic) <rs@adtraffic.de>
  * @copyright   (c) 2026 adtraffic - https://www.adtraffic.de
  * @license     MIT - see LICENSE file or https://opensource.org/licenses/MIT
@@ -29,6 +29,9 @@
  *   4. Set DRY_RUN = false and schedule the script (e.g. daily).
  *
  * Changelog
+ *   1.1.0  2026-11-18  Terms already blocked by a phrase / broad negative of
+ *                      the list are no longer added (no loop with the
+ *                      Negatives Consolidator or manual phrase negatives).
  *   1.0.0  2026-10-30  First public single-account release.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. Always
@@ -113,7 +116,7 @@ const LONG_TERM_HANDLING = 'phrase';
 // ===========================================================================
 
 const SCRIPT_NAME = 'Search Query Excluder';
-const SCRIPT_VERSION = '1.0.0';
+const SCRIPT_VERSION = '1.1.0';
 const SCRIPT_URL = 'https://www.adtraffic.de';
 
 const RULES_SHEET = 'rules';
@@ -240,13 +243,16 @@ function processRule(rule, context, listCache) {
     return result;
   }
 
-  // 3. Negative keyword list (existing negatives are not added again)
+  // 3. Negative keyword list: terms already blocked by a negative of the list
+  //    (exact, phrase or broad - e.g. after consolidation) are not added again
   let list = listCache[rule.listName] || null;
-  const existing = list ? readExistingNegatives(list) : {};
-  let candidates = plan.candidates.filter(c => !existing[c.negative.toLowerCase()]);
-  result.alreadyExcluded = plan.candidates.length - candidates.length;
+  const index = buildNegativeIndex(list ? readExistingNegatives(list) : []);
+  const coverage = filterBlockedCandidates(plan.candidates, index);
+  let candidates = coverage.candidates;
+  result.blockedTerms = coverage.blocked;
+  result.alreadyExcluded = coverage.blocked.length;
 
-  const capacity = LIMITS.maxKeywordsPerList - Object.keys(existing).length;
+  const capacity = LIMITS.maxKeywordsPerList - index.count;
   const limit = Math.min(MAX_NEW_NEGATIVES_PER_RULE, Math.max(capacity, 0));
 
   if (candidates.length > limit) {
@@ -289,6 +295,7 @@ function emptyResult(rule, error) {
     checked: 0,
     irrelevant: 0,
     alreadyExcluded: 0,
+    blockedTerms: [],
     terms: [],
     protectedTerms: [],
     skippedTerms: [],
@@ -393,6 +400,106 @@ function normalizeTerm(text) {
 
 function transliterate(text) {
   return text.replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss');
+}
+
+// ---------------------------------------------------------------------------
+// Coverage: is a search term already blocked by a negative of the list?
+// Uses Google's negative matching (no close variants, so words are compared
+// exactly):
+//   [exact]   same words in the same order, nothing else
+//   "phrase"  the words in this order as part of the term
+//   broad     all words anywhere in the term
+// ---------------------------------------------------------------------------
+
+// Pure function: builds a lookup structure from { text, type } negatives
+function buildNegativeIndex(negatives) {
+  const index = { exact: {}, byWord: {}, count: 0 };
+  negatives.forEach(n => addToNegativeIndex(index, n));
+  return index;
+}
+
+function addToNegativeIndex(index, n) {
+  index.count++;
+
+  if (n.type === 'EXACT') {
+    index.exact[n.text] = index.exact[n.text] || formatNegative(n);
+    return;
+  }
+
+  // Phrase and broad negatives only match terms containing their first word
+  const first = n.text.split(' ')[0];
+  (index.byWord[first] = index.byWord[first] || []).push(n);
+}
+
+// Returns the negative (with match type syntax) blocking the term, or ''
+function findBlockingNegative(term, index) {
+  const text = sanitizeKeyword(term);
+
+  if (!text) {
+    return '';
+  }
+
+  if (index.exact[text]) {
+    return index.exact[text];
+  }
+
+  const words = text.split(' ').filter((w, i, a) => a.indexOf(w) === i);
+
+  for (const word of words) {
+    for (const n of index.byWord[word] || []) {
+      if (n.type === 'PHRASE' ? containsPhrase(text, n.text) : containsAllWords(text, n.text)) {
+        return formatNegative(n);
+      }
+    }
+  }
+
+  return '';
+}
+
+// Pure function: splits candidates into new ones and ones already blocked.
+// Negatives planned in this run count as well (e.g. two long terms that are
+// shortened to the same phrase).
+function filterBlockedCandidates(candidates, index) {
+  const result = { candidates: [], blocked: [] };
+
+  for (const c of candidates) {
+    const by = findBlockingNegative(c.term, index) || findBlockingNegative(negativeText(c.negative), index);
+
+    if (by) {
+      result.blocked.push(Object.assign({}, c, { blockedBy: by }));
+      continue;
+    }
+
+    result.candidates.push(c);
+    addToNegativeIndex(index, parseNegative(c.negative));
+  }
+
+  return result;
+}
+
+// true if `needle` occurs in `haystack` as consecutive whole words
+function containsPhrase(haystack, needle) {
+  return ` ${haystack} `.indexOf(` ${needle} `) >= 0;
+}
+
+// true if all words of `needle` occur in `haystack` in any order
+function containsAllWords(haystack, needle) {
+  const h = {};
+  haystack.split(' ').forEach(w => { h[w] = true; });
+  return needle.split(' ').every(w => h[w]);
+}
+
+function parseNegative(negative) {
+  const type = negative.charAt(0) === '[' ? 'EXACT' : negative.charAt(0) === '"' ? 'PHRASE' : 'BROAD';
+  return { text: negativeText(negative), type: type };
+}
+
+function negativeText(negative) {
+  return normalizeTerm(String(negative).replace(/^[\["]+|[\]"]+$/g, ''));
+}
+
+function formatNegative(n) {
+  return n.type === 'PHRASE' ? `"${n.text}"` : n.type === 'BROAD' ? n.text : `[${n.text}]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -656,20 +763,23 @@ function loadNegativeKeywordLists() {
   return lists;
 }
 
-// Returns a map of existing negatives, keyed by keyword text incl. match type syntax
+// Returns all negatives of a list as { text, type } (text without match type syntax)
 function readExistingNegatives(list) {
-  const existing = {};
+  const negatives = [];
   const it = list.negativeKeywords().get();
 
   while (it.hasNext()) {
     const kw = it.next();
-    const text = normalizeTerm(kw.getText()).replace(/^[\["]|[\]"]$/g, '');
-    const type = typeof kw.getMatchType === 'function' ? String(kw.getMatchType()).toUpperCase() : 'EXACT';
-    const formatted = type === 'PHRASE' ? `"${text}"` : type === 'BROAD' ? text : `[${text}]`;
-    existing[formatted] = true;
+    const rawType = typeof kw.getMatchType === 'function' ? String(kw.getMatchType()).toUpperCase() : 'EXACT';
+    const type = rawType === 'PHRASE' || rawType === 'BROAD' ? rawType : 'EXACT';
+    const text = normalizeTerm(String(kw.getText()).replace(/^[\["]+|[\]"]+$/g, '').replace(/(^|\s)\+/g, '$1'));
+
+    if (text) {
+      negatives.push({ text: text, type: type });
+    }
   }
 
-  return existing;
+  return negatives;
 }
 
 function createNegativeKeywordList(name) {
@@ -795,7 +905,8 @@ const I18N = {
     testRule: 'Rule in test mode - nothing was changed.',
     listCreated: name => `Negative keyword list "${name}" was created.`,
     attached: (test, n, names) => `${test ? 'Would attach' : 'List attached to'} ${n} campaign(s): ${names}`,
-    alreadyExcluded: n => `${n} irrelevant term(s) were already in the list.`,
+    alreadyExcluded: n => `${n} irrelevant term(s) are already blocked by negatives of the list.`,
+    blockedExamples: 'E.g.:',
     protected: n => `${n} term(s) protected (conversions or own keyword):`,
     skipped: n => `${n} term(s) skipped:`,
     error: 'Error', warning: 'Note', general: 'General',
@@ -826,7 +937,8 @@ const I18N = {
     testRule: 'Regel im Testmodus - es wurde nichts verändert.',
     listCreated: name => `Ausschlussliste "${name}" wurde angelegt.`,
     attached: (test, n, names) => `${test ? 'Würde zuordnen' : 'Liste zugeordnet'} (${n} Kampagnen): ${names}`,
-    alreadyExcluded: n => `${n} unpassende(r) Begriff(e) war(en) bereits in der Liste.`,
+    alreadyExcluded: n => `${n} unpassende(r) Begriff(e) bereits durch Negatives der Liste blockiert.`,
+    blockedExamples: 'Z. B.:',
     protected: n => `${n} Begriff(e) geschützt (Conversions oder eigenes Keyword):`,
     skipped: n => `${n} Begriff(e) übersprungen:`,
     error: 'Fehler', warning: 'Hinweis', general: 'Allgemein',
@@ -940,7 +1052,13 @@ function buildMailHtml(results, problems, context) {
     }
 
     if (r.alreadyExcluded > 0) {
-      body += mailNote(t.alreadyExcluded(fmt(r.alreadyExcluded)));
+      // Show examples blocked by a phrase / broad negative first (e.g. after consolidation)
+      const examples = r.blockedTerms
+        .filter(x => x.blockedBy !== `[${sanitizeKeyword(x.term)}]`)
+        .slice(0, 5)
+        .map(x => `${x.term} ← ${x.blockedBy}`);
+      body += mailNote(t.alreadyExcluded(fmt(r.alreadyExcluded)) +
+        (examples.length ? ` ${t.blockedExamples} ${examples.join(', ')}${r.blockedTerms.length > examples.length ? ', ...' : ''}` : ''));
     }
 
     if (r.protectedTerms.length > 0) {
@@ -1035,5 +1153,5 @@ function mailLayout(o) {
 
 // Allows running the unit tests with Node.js (ignored by Google Ads)
 if (typeof module !== 'undefined') {
-  module.exports = { buildPlan, toNegativeKeyword, parseRuleRows, validateRules, buildMailHtml, main };
+  module.exports = { buildPlan, toNegativeKeyword, parseRuleRows, validateRules, buildMailHtml, buildNegativeIndex, findBlockingNegative, filterBlockedCandidates, main };
 }

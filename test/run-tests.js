@@ -43,7 +43,12 @@ const searchTermRows = [
   ['brand x', 'AI Max A', 40, 4, 2e6, 0],               // own keyword -> protected
   ['already excluded term', 'AI Max A', 5, 0, 0, 0],
   ['bad term', 'AI Max A', 5, 0, 0, 0],                 // rejected by API mock
-  ['one two three four five six seven eight nine ten eleven twelve', 'AI Max A', 3, 0, 0, 0]
+  ['one two three four five six seven eight nine ten eleven twelve', 'AI Max A', 3, 0, 0, 0],
+  ['karate landshut', 'AI Max A', 8, 1, 1e6, 0],        // blocked by phrase "karate" (consolidated)
+  ['Kinder Karate', 'AI Max A', 6, 0, 0, 0],            // blocked by phrase "karate"
+  ['karatekurs', 'AI Max A', 4, 0, 0, 0],               // NOT blocked: phrase needs whole words
+  ['jobs in hamburg', 'AI Max A', 7, 0, 0, 0],          // blocked by broad hamburg jobs
+  ['last minute flights', 'AI Max A', 5, 0, 0, 0]       // NOT blocked: "minute deals" not contained
 ];
 
 global.AdsApp = {
@@ -106,22 +111,63 @@ assert.strictEqual(validated.rules.length, 2);
 assert.strictEqual(validated.rules[0].mode, 'test');
 assert.strictEqual(validated.problems.length, 1);
 
+// Coverage: Google's negative matching
+const idx = sqe.buildNegativeIndex([
+  { text: 'weather today', type: 'EXACT' },
+  { text: 'cheap flights', type: 'PHRASE' },
+  { text: 'hamburg jobs', type: 'BROAD' }
+]);
+assert.strictEqual(sqe.findBlockingNegative('Weather  today', idx), '[weather today]');
+assert.strictEqual(sqe.findBlockingNegative('weather today berlin', idx), '');       // exact: no extra words
+assert.strictEqual(sqe.findBlockingNegative('today weather', idx), '');              // exact: order matters
+assert.strictEqual(sqe.findBlockingNegative('cheap flights', idx), '"cheap flights"');
+assert.strictEqual(sqe.findBlockingNegative('very cheap flights rome', idx), '"cheap flights"');
+assert.strictEqual(sqe.findBlockingNegative('flights cheap', idx), '');              // phrase: order matters
+assert.strictEqual(sqe.findBlockingNegative('cheap last minute flights', idx), '');  // phrase: consecutive
+assert.strictEqual(sqe.findBlockingNegative('cheapflights', idx), '');               // whole words only
+assert.strictEqual(sqe.findBlockingNegative('jobs in hamburg', idx), 'hamburg jobs');
+assert.strictEqual(sqe.findBlockingNegative('hamburg', idx), '');                    // broad: all words
+assert.strictEqual(sqe.findBlockingNegative('cheap flights? (rome)', idx), '"cheap flights"');
+
+// Negatives planned in the same run block later candidates
+const runIdx = sqe.buildNegativeIndex([]);
+const filtered = sqe.filterBlockedCandidates([
+  { term: 'a b c d e f g h i j k', negative: '"a b c d e f g h i j"' },
+  { term: 'a b c d e f g h i j x', negative: '"a b c d e f g h i j"' },
+  { term: 'foo', negative: '[foo]' },
+  { term: 'Foo', negative: '[foo]' }
+], runIdx);
+assert.deepStrictEqual(filtered.candidates.map(c => c.term), ['a b c d e f g h i j k', 'foo']);
+assert.deepStrictEqual(filtered.blocked.map(c => c.blockedBy), ['"a b c d e f g h i j"', '[foo]']);
+assert.strictEqual(runIdx.count, 2);
+
 // --- Integration: full run --------------------------------------------------
 
-makeList('SQE - AI Max negatives', [{ text: '[already excluded term]', type: 'EXACT' }]);
+makeList('SQE - AI Max negatives', [
+  { text: '[already excluded term]', type: 'EXACT' },
+  { text: '"karate"', type: 'PHRASE' },
+  { text: '"minute deals"', type: 'PHRASE' },
+  { text: '+hamburg +jobs', type: 'BROAD' }
+]);
 sqe.main();
 
 assert.deepStrictEqual(state.added.sort(), [
   '"one two three four five six seven eight nine ten"',
   '[cheap flights to rome]',
+  '[karatekurs]',
+  '[last minute flights]',
   '[weather tomorrow]'
 ]);
 assert.deepStrictEqual(state.attached, ['AI Max A', 'AI Max B']);
 assert.strictEqual(state.mails.length, 1);
-assert.ok(state.mails[0].subject.includes('3 search term(s) excluded'), state.mails[0].subject);
+assert.ok(state.mails[0].subject.includes('5 search term(s) excluded'), state.mails[0].subject);
 assert.ok(state.mails[0].htmlBody.includes('cheap flights to rome'));
 assert.ok(state.mails[0].htmlBody.includes('has conversions'));
 assert.ok(state.mails[0].htmlBody.includes('INVALID_CHARACTER'));
+assert.ok(state.mails[0].htmlBody.includes('4 irrelevant term(s) are already blocked'), 'blocked note');
+assert.ok(state.mails[0].htmlBody.includes('karate landshut ← &quot;karate&quot;'), 'blocked example');
+assert.ok(state.mails[0].htmlBody.includes('jobs in hamburg ← hamburg jobs'), 'broad example');
+assert.ok(!state.mails[0].htmlBody.includes('already excluded term ←'), 'identical exact not listed as example');
 
 const out = path.join(__dirname, 'output');
 fs.mkdirSync(out, { recursive: true });

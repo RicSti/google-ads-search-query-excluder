@@ -18,6 +18,7 @@ Runs inside a single Google Ads account. No API keys, no external services.
   - a rule is skipped if a suspiciously high share of terms would be excluded (broken pattern)
   - max. number of new negatives per rule and run, 5,000-negatives-per-list limit respected
   - invalid terms are rejected individually instead of breaking the whole run
+- **No duplicates, no loops:** a term already blocked by any negative of the list (`[exact]`, `"phrase"` or broad) is not added again – works together with the [Search Query Negatives Consolidator](https://github.com/RicSti/google-ads-search-query-negatives-consolidator) and with negatives you add by hand
 - **Creates the negative keyword list** if missing and **attaches it** to all campaigns matching the rule
 - Umlaut-tolerant matching (`maenner` in the pattern also matches `männer`)
 - Terms longer than Google's limit (80 characters / 10 words) are added as `"phrase match"` of their first words – a shortened exact negative would not block anything
@@ -94,6 +95,8 @@ Column order does not matter, the script finds the columns by their header names
 - Only search terms that Google reports in the *Search terms* report are considered (low-volume terms may be hidden by Google).
 - Negatives are added to **shared lists**. Google allows max. 5,000 negatives per list and 20 lists per account.
 - Lists are only attached to campaigns returned by `AdsApp.campaigns()` (Search / Display). Attach lists to other campaign types manually if needed.
+- **Already blocked terms:** before adding a negative, the script checks the current content of the list using Google's negative matching rules – `[a b]` blocks only *a b*, `"a b"` blocks every term containing *a b* as consecutive words, broad `a b` blocks every term containing both words. Negatives don't match close variants, so the check compares whole words exactly (`"karate"` does not block *karatekurs*). Only the rule's own list is checked, not campaign-level negatives or other lists.
+- **Combined with the Negatives Consolidator:** the order of both scripts doesn't matter. Search terms from before the consolidation are recognized as blocked by the new phrase negatives and not added again.
 - The script runs in a single account. For manager accounts (MCC) run it in each client account.
 
 ## Development
